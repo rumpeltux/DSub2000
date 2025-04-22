@@ -30,6 +30,56 @@ import static github.paroj.dsub2000.domain.PlayerState.STARTED;
 import static github.paroj.dsub2000.domain.PlayerState.STOPPED;
 import static github.paroj.dsub2000.domain.RemoteControlState.LOCAL;
 
+import android.annotation.TargetApi;
+import android.app.Activity;
+import android.app.Service;
+import android.content.ComponentCallbacks2;
+import android.content.ComponentName;
+import android.content.Context;
+import android.content.Intent;
+import android.content.IntentFilter;
+import android.content.SharedPreferences;
+import android.media.AudioManager;
+import android.media.MediaPlayer;
+import android.media.PlaybackParams;
+import android.media.audiofx.AudioEffect;
+import android.net.Uri;
+import android.net.wifi.WifiManager;
+import android.os.Build;
+import android.os.Handler;
+import android.os.IBinder;
+import android.os.Looper;
+import android.os.PowerManager;
+import android.util.Log;
+import android.view.KeyEvent;
+
+import androidx.annotation.OptIn;
+import androidx.collection.LruCache;
+import androidx.media3.common.MediaItem;
+import androidx.media3.common.Player;
+import androidx.media3.common.util.UnstableApi;
+import androidx.media3.datasource.DataSource;
+import androidx.media3.datasource.DefaultDataSource;
+import androidx.media3.exoplayer.ExoPlayer;
+import androidx.media3.exoplayer.source.DefaultMediaSourceFactory;
+import androidx.media3.exoplayer.source.MediaSource;
+import androidx.media3.exoplayer.source.ProgressiveMediaSource;
+import androidx.media3.session.MediaSession;
+import androidx.mediarouter.media.MediaRouteSelector;
+import androidx.mediarouter.media.MediaRouter;
+
+import java.io.File;
+import java.io.IOException;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Collections;
+import java.util.Date;
+import java.util.Iterator;
+import java.util.List;
+import java.util.Timer;
+import java.util.TimerTask;
+import java.util.concurrent.CopyOnWriteArrayList;
+
 import github.paroj.dsub2000.R;
 import github.paroj.dsub2000.activity.SubsonicActivity;
 import github.paroj.dsub2000.audiofx.AudioEffectsController;
@@ -45,12 +95,12 @@ import github.paroj.dsub2000.domain.ServerInfo;
 import github.paroj.dsub2000.receiver.AudioNoisyReceiver;
 import github.paroj.dsub2000.receiver.MediaButtonIntentReceiver;
 import github.paroj.dsub2000.util.ArtistRadioBuffer;
-import github.paroj.dsub2000.util.ImageLoader;
-import github.paroj.dsub2000.util.Notifications;
-import github.paroj.dsub2000.util.SilentBackgroundTask;
 import github.paroj.dsub2000.util.Constants;
+import github.paroj.dsub2000.util.ImageLoader;
 import github.paroj.dsub2000.util.MediaRouteManager;
+import github.paroj.dsub2000.util.Notifications;
 import github.paroj.dsub2000.util.ShufflePlayBuffer;
+import github.paroj.dsub2000.util.SilentBackgroundTask;
 import github.paroj.dsub2000.util.SimpleServiceBinder;
 import github.paroj.dsub2000.util.UpdateHelper;
 import github.paroj.dsub2000.util.Util;
@@ -59,48 +109,11 @@ import github.paroj.dsub2000.util.tags.BastpUtil;
 import github.paroj.dsub2000.view.UpdateView;
 import github.paroj.serverproxy.BufferProxy;
 
-import java.io.File;
-import java.io.IOException;
-import java.util.ArrayList;
-import java.util.Arrays;
-import java.util.Collections;
-import java.util.Date;
-import java.util.Iterator;
-import java.util.List;
-import java.util.Timer;
-import java.util.TimerTask;
-import java.util.concurrent.CopyOnWriteArrayList;
-
-import android.annotation.TargetApi;
-import android.app.Activity;
-import android.app.Service;
-import android.content.ComponentCallbacks2;
-import android.content.ComponentName;
-import android.content.Context;
-import android.content.Intent;
-import android.content.IntentFilter;
-import android.content.SharedPreferences;
-import android.media.AudioManager;
-import android.media.MediaPlayer;
-import android.media.PlaybackParams;
-import android.media.audiofx.AudioEffect;
-import android.net.wifi.WifiManager;
-import android.os.Build;
-import android.os.Handler;
-import android.os.IBinder;
-import android.os.Looper;
-import android.os.PowerManager;
-import androidx.mediarouter.media.MediaRouteSelector;
-import androidx.mediarouter.media.MediaRouter;
-import android.util.Log;
-import androidx.collection.LruCache;
-import android.view.KeyEvent;
-
 /**
  * @author Sindre Mehus
  * @version $Id$
  */
-public class DownloadService extends Service {
+public class DownloadService extends Service implements Player.Listener {
 	private static final String TAG = DownloadService.class.getSimpleName();
 
 	public static final String CMD_PLAY = "github.paroj.dsub2000.CMD_PLAY";
@@ -130,8 +143,7 @@ public class DownloadService extends Service {
 
 	private final IBinder binder = new SimpleServiceBinder<>(this);
 	private Looper mediaPlayerLooper;
-	private MediaPlayer mediaPlayer;
-	private MediaPlayer nextMediaPlayer;
+	private ExoPlayer mediaPlayer;
 	private int audioSessionId;
 	private boolean nextSetup = false;
 	private final List<DownloadFile> downloadList = new ArrayList<DownloadFile>();
@@ -196,6 +208,7 @@ public class DownloadService extends Service {
 	 * Reference to precreated BASTP Object
 	 */
 	private BastpUtil mBastpUtil;
+	private MediaSession mediaSession;
 
 	@Override
 	public void onCreate() {
@@ -203,12 +216,16 @@ public class DownloadService extends Service {
 
 		final SharedPreferences prefs = Util.getPreferences(this);
 		new Thread(new Runnable() {
+			@OptIn(markerClass = UnstableApi.class)
 			public void run() {
 				Looper.prepare();
 
 				mBastpUtil = new BastpUtil();
-				mediaPlayer = new MediaPlayer();
-				mediaPlayer.setWakeMode(DownloadService.this, PowerManager.PARTIAL_WAKE_LOCK);
+				mediaPlayer = new ExoPlayer.Builder(DownloadService.this).build();
+				mediaPlayer.addListener(DownloadService.this);
+				mediaPlayer.setWakeMode(PowerManager.PARTIAL_WAKE_LOCK);
+
+				mediaSession = new MediaSession.Builder(DownloadService.this, mediaPlayer).build();
 
 				// We want to change audio session id's between upgrading Android versions.  Upgrading to Android 7.0 is broken (probably updated session id format)
 				audioSessionId = -1;
@@ -225,7 +242,6 @@ public class DownloadService extends Service {
 				}
 
 				if(audioSessionId == -1) {
-					mediaPlayer.setAudioStreamType(AudioManager.STREAM_MUSIC);
 					try {
 						audioSessionId = mediaPlayer.getAudioSessionId();
 
@@ -238,13 +254,13 @@ public class DownloadService extends Service {
 					}
 				}
 
-				mediaPlayer.setOnErrorListener(new MediaPlayer.OnErrorListener() {
+				/*mediaPlayer.setOnErrorListener(new MediaPlayer.OnErrorListener() {
 					@Override
 					public boolean onError(MediaPlayer mediaPlayer, int what, int more) {
 						handleError(new Exception("MediaPlayer error: " + what + " (" + more + ")"));
 						return false;
 					}
-				});
+				});*/
 
 				/*try {
 					Intent i = new Intent(AudioEffect.ACTION_OPEN_AUDIO_EFFECT_CONTROL_SESSION);
@@ -321,6 +337,26 @@ public class DownloadService extends Service {
 		if(Build.VERSION.SDK_INT >= 26 && !this.isForeground() && !"KEYCODE_MEDIA_START".equals(action)) {
 			Notifications.shutGoogleUpNotification(this);
 		}
+		if (action != null) {
+			switch (action) {
+				case CMD_PLAY:
+					play();
+					break;
+				case CMD_PAUSE:
+				case CMD_TOGGLEPAUSE:
+					pause();
+					break;
+				case CMD_STOP:
+					stop();
+					break;
+				case CMD_NEXT:
+					next();
+					break;
+				case CMD_PREVIOUS:
+					previous();
+					break;
+			}
+		}
 		return START_NOT_STICKY;
 	}
 
@@ -366,11 +402,6 @@ public class DownloadService extends Service {
 			// Froyo or lower
 		}
 
-		mediaPlayer.release();
-		if(nextMediaPlayer != null) {
-			nextMediaPlayer.release();
-		}
-		mediaPlayerLooper.quit();
 		shufflePlayBuffer.shutdown();
 		effectsController.release();
 		if (mRemoteControl != null) {
@@ -539,6 +570,23 @@ public class DownloadService extends Service {
 		checkDownloads();
 		lifecycleSupport.serializeDownloadQueue();
 	}
+
+	@OptIn(markerClass = UnstableApi.class)
+	private void setMediaItemAndPrepare(DownloadFile file) {
+        if (file == null) return;
+        Uri uri = Uri.fromFile(file.getFile());  // Or handle streaming URI
+
+        MediaItem mediaItem = new MediaItem.Builder()
+                .setUri(uri)
+                .build();
+
+        DataSource.Factory dataSourceFactory = new DefaultDataSource.Factory(this);
+		ProgressiveMediaSource mediaSource = new ProgressiveMediaSource.Factory(dataSourceFactory)
+				.createMediaSource(mediaItem);
+
+        mediaPlayer.setMediaSource(mediaSource);
+		mediaPlayer.prepare();
+    }
 
 	private synchronized void updateRemotePlaylist() {
 		List<DownloadFile> playlist = new ArrayList<>();
@@ -1099,12 +1147,60 @@ public class DownloadService extends Service {
 	/** Plays either the current song (resume) or the first/next one in queue. */
 	public synchronized void play()
 	{
-		int current = getCurrentPlayingIndex();
-		if (current == -1) {
-			play(0);
-		} else {
-			play(current);
+		if (playerState == PAUSED || playerState == STOPPED || playerState == PREPARED || playerState == COMPLETED) {
+			player.play();
+		} else if (playerState == IDLE) {
+			play(0, true, 0);
 		}
+	}
+
+
+	public void play(int index, boolean autoPlayStart, int position) {
+		if (downloadList.isEmpty()) {
+			Log.w(TAG, "No songs in the download list.  Cannot play.");
+			return;
+		}
+
+		if (index < 0 || index >= downloadList.size()) {
+			Log.w(TAG, "Invalid index: " + index + ".  Using index 0.");
+			index = 0;
+		}
+
+		currentPlayingIndex = index;
+		currentPlaying = downloadList.get(index);
+
+		setMediaItemAndPrepare(currentPlaying);
+		if (autoPlayStart) {
+			player.setPlayWhenReady(true);
+		} else {
+			player.seekTo(position);
+		}
+		updatePlaybackState(PREPARING);
+		currentPlaying.setPlaying(true);
+		lifecycleSupport.serializeDownloadQueue();
+		updateRemotePlaylist();
+	}
+
+
+	private void togglePause() {
+		if (playerState == STARTED) {
+			pause();
+		} else {
+			play(); // Resume or start new if stopped.
+		}
+	}
+
+
+	private void pause() {
+		if (playerState == STARTED) {
+			player.pause();
+		}
+	}
+
+
+	private void stop() {
+		player.stop();
+		updatePlaybackState(STOPPED); // Or IDLE?  Decide based on your needs.
 	}
 
 	public synchronized void play(int index) {
@@ -1929,6 +2025,7 @@ public class DownloadService extends Service {
 		}
 	}
 
+	@OptIn(markerClass = UnstableApi.class)
 	private synchronized void doPlay(final DownloadFile downloadFile, final int position, final boolean start) {
 		try {
 			subtractPosition = 0;
@@ -1937,11 +2034,7 @@ public class DownloadService extends Service {
 			mediaPlayer.setOnErrorListener(null);
 			mediaPlayer.reset();
 			setPlayerState(IDLE);
-			try {
-				mediaPlayer.setAudioSessionId(audioSessionId);
-			} catch(Throwable e) {
-				mediaPlayer.setAudioStreamType(AudioManager.STREAM_MUSIC);
-			}
+			mediaPlayer.setAudioSessionId(audioSessionId);
 
 			String dataSource;
 			boolean isPartial = false;
@@ -1969,7 +2062,7 @@ public class DownloadService extends Service {
 				}
 			}
 
-			mediaPlayer.setDataSource(dataSource);
+			setMediaItemAndPrepare(currentPlaying);
 			setPlayerState(PREPARING);
 
 			mediaPlayer.setOnBufferingUpdateListener(new MediaPlayer.OnBufferingUpdateListener() {
